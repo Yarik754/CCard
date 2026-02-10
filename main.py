@@ -1,783 +1,535 @@
-import sys
-import time
-import threading
-import psutil
-import json
-import re
-import unicodedata
-import numpy as np
-import cv2
-import sounddevice as sd
+import sys,time,threading,subprocess,psutil,json,re,unicodedata,shutil,os,datetime
+import numpy as np,cv2,sounddevice as sd
+from PIL import ImageGrab
 from pygrabber.dshow_graph import FilterGraph
-
-from PyQt6 import QtCore, QtGui, QtWidgets
-
+from PyQt6 import QtCore,QtGui,QtWidgets
 try:
-    import win32con
-    import win32gui
-    WIN32_AVAILABLE = True
+    import win32gui,win32con
+    WIN32=True
 except Exception:
-    WIN32_AVAILABLE = False
+    WIN32=False
 
+SETTINGS={}
+try:
+    with open('settings.json','r',encoding='utf-8') as f: SETTINGS.update(json.load(f))
+except Exception:
+    SETTINGS.setdefault('resolution',[1280,720]);SETTINGS.setdefault('fps',120)
 
-def load_settings(filename="settings.json"):
-    """Download settings JSON"""
+T={
+ 'uk':{'camera':'Камера','resolution':'Розділення','fps':'FPS','audio_in':'Аудіо вхід','toggle_debug':'Дебаг режим','fullscreen':'На весь екран','settings':'Налаштування','settings_title':'Налаштування','theme':'Тема','language':'Мова','dark':'Темна','light':'Світла','ok':'ОК','cancel':'Скасувати','source':'Джерело','android_device':'Android пристрій','sound_on':'Звук увімк.','sound_off':'Звук вимк.'},
+ 'en':{'camera':'Camera','resolution':'Resolution','fps':'FPS','audio_in':'Audio In','toggle_debug':'Toggle Debug','fullscreen':'Fullscreen','settings':'Settings','settings_title':'Settings','theme':'Theme','language':'Language','dark':'Dark','light':'Light','ok':'OK','cancel':'Cancel','source':'Source','android_device':'Android Device','sound_on':'Sound On','sound_off':'Sound Off'} }
+def txt(k): return T.get(SETTINGS.get('language','uk'),T['uk']).get(k,k)
+
+def _log_scrcpy(msg):
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Error loading settings from {filename}: {e}")
-        return {
-            "resolution": [1280, 720],
-            "fps": 120
-        }
-
-
-def save_settings(settings, filename="settings.json"):
-    """Save settings JSON"""
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error saving settings to {filename}: {e}")
-
-
-# Download settings
-SETTINGS = load_settings()
-WIDTH, HEIGHT = 1280, 720
-CONTROL_PANEL_HEIGHT = 80
-DEVICE_POLL_INTERVAL = 2.0
-
-# Translateions
-TRANSLATIONS = {
-    "uk": {
-        "camera": "Камера",
-        "resolution": "Розділення",
-        "fps": "FPS",
-        "audio_in": "Аудіо вхід",
-        "toggle_debug": "Дебаг режим",
-        "fullscreen": "На весь екран",
-        "settings": "Налаштування",
-        "settings_title": "Налаштування",
-        "theme": "Тема",
-        "language": "Мова",
-        "dark": "Темна",
-        "light": "Світла",
-        "ok": "ОК",
-        "cancel": "Скасувати",
-    },
-    "en": {
-        "camera": "Camera",
-        "resolution": "Resolution",
-        "fps": "FPS",
-        "audio_in": "Audio In",
-        "toggle_debug": "Toggle Debug",
-        "fullscreen": "Fullscreen",
-        "settings": "Settings",
-        "settings_title": "Settings",
-        "theme": "Theme",
-        "language": "Language",
-        "dark": "Dark",
-        "light": "Light",
-        "ok": "OK",
-        "cancel": "Cancel",
-    }
-}
-
-# Get text for current language
-
-def get_text(key):
-    lang = SETTINGS.get("language", "uk")
-    return TRANSLATIONS.get(lang, TRANSLATIONS["uk"]).get(key, key)
-
-# Apply theme
+        fn=os.path.join(os.path.dirname(__file__),'scrcpy_debug.log')
+        with open(fn,'a',encoding='utf-8') as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
 
 def apply_theme():
-    theme = SETTINGS.get("theme", "dark")
-    if theme == "dark":
-        style = """
+    theme=SETTINGS.get('theme','dark')
+    if theme=='dark':
+        return """
         QWidget { background-color: #1e1e1e; color: white; }
         QComboBox { background-color: #2e2e2e; color: white; border: 1px solid #555; padding: 3px; }
-        QComboBox::drop-down { border: none; }
         QPushButton { background-color: #3e3e3e; color: white; border: 1px solid #555; padding: 5px; }
-        QPushButton:hover { background-color: #4e4e4e; border: 1px solid #777; }
-        QLabel { color: white; background-color: transparent; }
-        QDialog { background-color: #1e1e1e; }
+        QLabel { color: white; }
         """
     else:
-        style = """
+        return """
         QWidget { background-color: #ffffff; color: black; }
         QComboBox { background-color: #f5f5f5; color: black; border: 1px solid #ccc; padding: 3px; }
-        QComboBox::drop-down { border: none; }
         QPushButton { background-color: #e0e0e0; color: black; border: 1px solid #999; padding: 5px; }
-        QPushButton:hover { background-color: #d0d0d0; border: 1px solid #666; }
-        QLabel { color: black; background-color: transparent; }
-        QDialog { background-color: #ffffff; }
+        QLabel { color: black; }
         """
-    return style
-
-# Get video devices from pygrabber
 
 def list_video_devices():
     try:
-        g = FilterGraph()
-        devices = g.get_input_devices()
-        if not devices:
-            return []
-        return devices
-    except Exception as e:
-        print("Error listing video devices:", e)
+        g=FilterGraph();d=g.get_input_devices();return d if d else []
+    except Exception:
         return []
-
-# Get audio devices from sounddevice
 
 def list_audio_input_devices():
     try:
-        devices = sd.query_devices()
-        inputs = []
-        seen_norm = set()
-        for d in devices:
-            try:
-                if d.get('max_input_channels', 0) > 0:
-                    name = d.get('name')
-                    if not name:
-                        continue
-                    # Unicode normalize, remove punctuation, collapse spaces, lowercase
-                    norm = unicodedata.normalize('NFKC', name)
-                    norm = norm.strip().lower()
-                    # remove punctuation (keep word chars and spaces)
-                    norm = re.sub(r"[^\w\s]", "", norm)
-                    # collapse multiple spaces
-                    norm = re.sub(r"\s+", " ", norm).strip()
-                    if norm and norm not in seen_norm:
-                        inputs.append(name)
-                        seen_norm.add(norm)
-            except Exception:
-                continue
-        return inputs
-    except Exception as e:
-        print("Error listing audio devices:", e)
+        devs=sd.query_devices();out=[];seen=set()
+        for d in devs:
+            if d.get('max_input_channels',0)>0:
+                n=d.get('name');
+                if not n: continue
+                s=unicodedata.normalize('NFKC',n);s=re.sub(r"[^\w\s]","",s).strip().lower();s=re.sub(r"\s+"," ",s)
+                if s and s not in seen: out.append(n);seen.add(s)
+        return out
+    except Exception:
         return []
 
-
-class CameraThread(QtCore.QThread):
-    frame_signal = QtCore.pyqtSignal(np.ndarray)
-    fps_signal = QtCore.pyqtSignal(float)
-
-    def __init__(self, cam_index=0, resolution=(1280,720), fps=120, parent=None):
-        super().__init__(parent)
-        self.cam_index = cam_index
-        self.resolution = resolution
-        self.fps = fps
-        self._running = False
-        self.cap = None
-
+class CamThread(QtCore.QThread):
+    frame_signal=QtCore.pyqtSignal(np.ndarray);fps_signal=QtCore.pyqtSignal(float)
+    def __init__(self,i=0,res=(1280,720),fps=120):
+        super().__init__();self.i=i;self.res=res;self.fps=fps;self._run=False;self.cap=None
     def run(self):
-        self._running = True
+        self._run=True
         try:
-            self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.resolution[0]))
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.resolution[1]))
-            self.cap.set(cv2.CAP_PROP_FPS, int(self.fps))
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception as e:
-            print("Camera open exception:", e)
-            self._running = False
-            return
-
-        prev = time.time()
-        while self._running:
-            ret, img = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            now = time.time()
-            fps_val = 1.0 / (now - prev) if (now - prev) > 1e-6 else 0.0
-            prev = now
-            self.fps_signal.emit(fps_val)
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            self.frame_signal.emit(rgb)
-
-            time.sleep(0.001)
-
-        try:
-            if self.cap:
-                self.cap.release()
+            self.cap=cv2.VideoCapture(self.i,cv2.CAP_DSHOW)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,int(self.res[0]));self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT,int(self.res[1]));self.cap.set(cv2.CAP_PROP_FPS,int(self.fps));self.cap.set(cv2.CAP_PROP_FOURCC,cv2.VideoWriter_fourcc(*'MJPG'))
         except Exception:
-            pass
-
-    def stop(self):
-        self._running = False
-        self.wait(1000)
-
+            self._run=False;return
+        prev=time.time()
+        while self._run:
+            ret,img=self.cap.read();
+            if not ret: time.sleep(0.01); continue
+            now=time.time();fps=1.0/(now-prev) if now-prev>1e-6 else 0;prev=now
+            self.fps_signal.emit(fps);self.frame_signal.emit(cv2.cvtColor(img,cv2.COLOR_BGR2RGB));time.sleep(0.001)
+        try: self.cap.release()
+        except Exception: pass
+    def stop(self): self._run=False; self.wait(1000)
 
 class AudioWorker(threading.Thread):
-    def __init__(self, input_device_index=None):
-        super().__init__(daemon=True)
-        self.input_device_index = input_device_index
-        self._running = threading.Event()
-        self._running.clear()
-
+    def __init__(self,i=None):
+        super().__init__(daemon=True);self.i=i;self._run=threading.Event();self._run.clear();self._muted=False
     def run(self):
-        def callback(indata, outdata, frames, time_info, status):
-            if status:
-                print("Audio status:", status)
+        def cb(indata,outdata,frames,time_info,status):
+            if status: print('Audio status',status)
             try:
-                outdata[:] = indata
+                outdata[:] = 0 if self._muted else indata
             except Exception:
                 outdata.fill(0)
-
         try:
-            with sd.Stream(device=(self.input_device_index, None),
-                           channels=1, samplerate=44100, callback=callback):
-                self._running.set()
-                while self._running.is_set():
-                    sd.sleep(100)
-        except Exception as e:
-            print("Audio worker error:", e)
+            with sd.Stream(device=(self.i,None),channels=1,samplerate=44100,callback=cb):
+                self._run.set();
+                while self._run.is_set(): sd.sleep(100)
+        except Exception as e: print('Audio error',e)
+    def stop(self): self._run.clear()
+    def set_muted(self,m): self._muted=bool(m)
 
+class AndroidScreenMirror:
+    def __init__(self,did,width=1280,height=720,fps=30):
+        self.did=did;self.w=width;self.h=height;self.fps=fps;self.running=False;self._t=None;self.cb=None;self.proc=None
+    def start(self,cb,parent_hwnd=None):
+        self.cb=cb;self.running=True;self._parent= int(parent_hwnd) if parent_hwnd else None;self._t=threading.Thread(target=self._loop,daemon=True);self._t.start();return True
+    def _loop(self):
+        try:
+            title=f'scrcpy_{self.did}';
+            cmd=["scrcpy","-s",self.did,"--video-bit-rate=2M","--max-fps","24","--no-audio","--stay-awake"]
+            if self._parent: cmd += ["--window-title",title]
+            # Log environment and command for troubleshooting when running
+            # as a windowed (no-console) frozen exe.
+            try:
+                _log_scrcpy(f"PATH={os.environ.get('PATH')}")
+                _log_scrcpy(f"which(scrcpy)={shutil.which('scrcpy')}")
+                _log_scrcpy(f"cmd={cmd}")
+            except Exception:
+                pass
+            # When running as a windowed (no-console) PyInstaller app, keeping
+            # stdout/stderr as pipes can block the child if nobody reads them.
+            # Redirect IO to DEVNULL and set Windows startup flags so scrcpy
+            # doesn't depend on the parent console.
+            startupinfo=None; creationflags=0
+            if WIN32:
+                try:
+                    startupinfo=subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                except Exception:
+                    startupinfo=None
+            try:
+                self.proc=subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, startupinfo=startupinfo, creationflags=creationflags)
+                _log_scrcpy(f"started scrcpy pid={getattr(self.proc,'pid',None)}")
+            except Exception as e:
+                _log_scrcpy(f"failed to start scrcpy: {e}")
+                raise
+            time.sleep(4)
+            self.embedded=False
+            if self._parent and WIN32:
+                try:
+                    hwnd=None
+                    def enum(h,p):
+                        nonlocal hwnd
+                        try:
+                            if title in win32gui.GetWindowText(h): hwnd=h; return False
+                        except Exception: pass
+                        return True
+                    win32gui.EnumWindows(enum,None)
+                    if hwnd:
+                        try:
+                            win32gui.SetParent(hwnd,self._parent)
+                            l,t,r,b=win32gui.GetClientRect(self._parent);win32gui.SetWindowPos(hwnd,0,0,0,r-l,b-t,win32con.SWP_NOZORDER)
+                            self.embedded=True
+                        except Exception as e:
+                            print('embed err',e)
+                except Exception as e: print('embed err',e)
+            if self.proc.poll() is not None:
+                _log_scrcpy('scrcpy exited early'); return
+            # If embedded successfully, let scrcpy render into our widget and don't screenshot
+            if self.embedded:
+                while self.running and self.proc.poll() is None:
+                    time.sleep(0.1)
+                return
+            interval=1.0/self.fps;last=time.time()
+            while self.running and self.proc.poll() is None:
+                now=time.time();
+                if now-last<interval: time.sleep(0.001); continue
+                try:
+                    img=ImageGrab.grab(bbox=(0,0,self.w,self.h))
+                except Exception as e:
+                    print('grab err',e); break
+                f=np.array(img,dtype=np.uint8)
+                if self.cb: self.cb(f)
+                last=now
+        except Exception as e:
+            print('mirror loop err',e)
+        finally:
+            self.running=False; self._cleanup()
+    def _cleanup(self):
+        if self.proc:
+            try: self.proc.terminate(); self.proc.wait(2)
+            except: 
+                try: self.proc.kill()
+                except: pass
+    def stop(self): self.running=False; self._cleanup();
+    @staticmethod
+    def available():
+        try:
+            which=shutil.which('scrcpy')
+            _log_scrcpy(f"available check which(scrcpy)={which}")
+            if which:
+                return True
+            # final check: try running --version without capturing into pipes
+            subprocess.run(["scrcpy","--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            return True
+        except Exception as e:
+            _log_scrcpy(f"available check failed: {e}")
+            return False
+
+class ScrcpyThread(QtCore.QThread):
+    frame_signal=QtCore.pyqtSignal(np.ndarray);fps_signal=QtCore.pyqtSignal(float);status_signal=QtCore.pyqtSignal(str)
+    def __init__(self,did=None,res=(1280,720),fps=30,parent_hwnd=None):
+        super().__init__();self.did=did;self.res=res;self.fps=fps;self.running=False;self.mirror=None;self.parent_hwnd=parent_hwnd;self._cnt=0;self._t0=time.time()
+    def run(self):
+        self.running=True
+        if not AndroidScreenMirror.available(): self.status_signal.emit('scrcpy not found'); self.running=False; return
+        self.mirror=AndroidScreenMirror(self.did,width=int(self.res[0]),height=int(self.res[1]),fps=self.fps)
+        if not self.mirror.start(self._on_frame,parent_hwnd=self.parent_hwnd): self.status_signal.emit('failed'); self.running=False; return
+        self.status_signal.emit('active')
+        while self.running: time.sleep(0.1)
+    def _on_frame(self,f):
+        if not self.running: return
+        self._cnt+=1;now=time.time();dt=now-self._t0
+        if dt>=1.0: self.fps_signal.emit(self._cnt/dt); self._cnt=0; self._t0=now
+        self.frame_signal.emit(f)
     def stop(self):
-        self._running.clear()
+        self.running=False
+        try:
+            # request thread quit and wait briefly
+            try:
+                self.quit()
+            except Exception:
+                pass
+            try:
+                self.wait(1000)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    def mute_audio(self):
+        try: subprocess.run(["adb","-s",self.did,"shell","input","keyevent","164"],timeout=5); return True
+        except Exception: return False
+    def unmute_audio(self): return self.mute_audio()
+
+def save_settings(s,fn='settings.json'):
+    try:
+        with open(fn,'w',encoding='utf-8') as f: json.dump(s,f,indent=2,ensure_ascii=False)
+    except Exception as e:
+        print('save settings err',e)
 
 class SettingsDialog(QtWidgets.QDialog):
-    settings_changed = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(get_text("settings_title"))
-        self.setModal(True)
-        self.setGeometry(100, 100, 450, 320)
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # Theme
-        theme_layout = QtWidgets.QHBoxLayout()
-        theme_layout.addWidget(QtWidgets.QLabel(get_text("theme")))
-        self.theme_combo = QtWidgets.QComboBox()
-        self.theme_combo.addItems([get_text("dark"), get_text("light")])
-        current_theme = SETTINGS.get("theme", "dark")
-        self.theme_combo.setCurrentText(get_text(current_theme))
-        theme_layout.addWidget(self.theme_combo)
-        layout.addLayout(theme_layout)
-
-        # Language
-        lang_layout = QtWidgets.QHBoxLayout()
-        lang_layout.addWidget(QtWidgets.QLabel(get_text("language")))
-        self.language_combo = QtWidgets.QComboBox()
-        self.language_combo.addItems(["Українська", "English"])
-        current_lang = SETTINGS.get("language", "uk")
-        self.language_combo.setCurrentIndex(0 if current_lang == "uk" else 1)
-        lang_layout.addWidget(self.language_combo)
-        layout.addLayout(lang_layout)
-
-        # Resolution
-        res_layout = QtWidgets.QHBoxLayout()
-        res_layout.addWidget(QtWidgets.QLabel(get_text("resolution")))
-        self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["640x480", "1280x720", "1920x1080"])
-        current_res = SETTINGS.get("resolution", [1280, 720])
-        self.res_combo.setCurrentText(f"{current_res[0]}x{current_res[1]}")
-        res_layout.addWidget(self.res_combo)
-        layout.addLayout(res_layout)
-
-        # FPS
-        fps_layout = QtWidgets.QHBoxLayout()
-        fps_layout.addWidget(QtWidgets.QLabel(get_text("fps")))
-        self.fps_combo = QtWidgets.QComboBox()
-        self.fps_combo.addItems(["10", "30", "60", "120"])
-        current_fps = str(SETTINGS.get("fps", 120))
-        self.fps_combo.setCurrentText(current_fps)
-        fps_layout.addWidget(self.fps_combo)
-        layout.addLayout(fps_layout)
-
-        layout.addStretch()
-
-        # Buttons
-        button_layout = QtWidgets.QHBoxLayout()
-        ok_btn = QtWidgets.QPushButton(get_text("ok"))
-        cancel_btn = QtWidgets.QPushButton(get_text("cancel"))
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(ok_btn)
-        button_layout.addWidget(cancel_btn)
-        layout.addLayout(button_layout)
-
-# Get settings
-
-    def get_settings(self):
-        theme_text = self.theme_combo.currentText()
-        theme = "dark" if "dark" in theme_text.lower() or "темна" in theme_text.lower() else "light"
-        
-        lang_idx = self.language_combo.currentIndex()
-        language = "uk" if lang_idx == 0 else "en"
-        
-        res_text = self.res_combo.currentText()
-        w, h = map(int, res_text.split("x"))
-        resolution = [w, h]
-        
-        fps = int(self.fps_combo.currentText())
-        
-        return {
-            "theme": theme,
-            "language": language,
-            "resolution": resolution,
-            "fps": fps
-        }
+    def __init__(self,parent=None):
+        super().__init__(parent);self.setWindowTitle(txt('settings_title'));self.setModal(True);self.setGeometry(100,100,420,260)
+        lay=QtWidgets.QVBoxLayout(self)
+        # theme/language
+        h=QtWidgets.QHBoxLayout();h.addWidget(QtWidgets.QLabel(txt('theme')));self.theme_combo=QtWidgets.QComboBox();self.theme_combo.addItems([txt('dark'),txt('light')]);h.addWidget(self.theme_combo);lay.addLayout(h)
+        h2=QtWidgets.QHBoxLayout();h2.addWidget(QtWidgets.QLabel(txt('language')));self.lang_combo=QtWidgets.QComboBox();self.lang_combo.addItems(['Українська','English']);h2.addWidget(self.lang_combo);lay.addLayout(h2)
+        # resolution/fps
+        r=QtWidgets.QHBoxLayout();r.addWidget(QtWidgets.QLabel(txt('resolution')));self.res_combo=QtWidgets.QComboBox();self.res_combo.addItems(['640x480','1280x720','1920x1080']);r.addWidget(self.res_combo);lay.addLayout(r)
+        f=QtWidgets.QHBoxLayout();f.addWidget(QtWidgets.QLabel(txt('fps')));self.fps_combo=QtWidgets.QComboBox();self.fps_combo.addItems(['10','30','60','120']);f.addWidget(self.fps_combo);lay.addLayout(f)
+        # buttons
+        b=QtWidgets.QHBoxLayout();ok=QtWidgets.QPushButton(txt('ok'));ok.clicked.connect(self.accept);b.addWidget(ok);b.addWidget(QtWidgets.QPushButton(txt('cancel'),clicked=self.reject));lay.addLayout(b)
+    def get(self):
+        theme='dark' if 'dark' in self.theme_combo.currentText().lower() else 'light'
+        lang='uk' if self.lang_combo.currentIndex()==0 else 'en'
+        w,h=map(int,self.res_combo.currentText().split('x'))
+        fps=int(self.fps_combo.currentText())
+        return {'theme':theme,'language':lang,'resolution':[w,h],'fps':fps}
 
 class FullscreenVideoWindow(QtWidgets.QWidget):
-    exit_fullscreen = QtCore.pyqtSignal()
-
+    exit_fullscreen=QtCore.pyqtSignal()
     def __init__(self):
-        super().__init__()
-        self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
-        self.video_label = QtWidgets.QLabel(self)
-        self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.debug_label = QtWidgets.QLabel(self)
-        self.debug_label.setStyleSheet("color: white; background: rgba(0,0,0,0);")
-        self.debug_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0)
-        layout.addWidget(self.video_label)
-        self._current_pixmap = None
-
-    def set_frame(self, frame: np.ndarray):
-        if frame is None:
-            return
-        h, w, ch = frame.shape
-        bytes_per_line = ch * w
-        qimg = QtGui.QImage(frame.data.tobytes(), w, h, bytes_per_line, QtGui.QImage.Format.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.width(), self.height(), QtCore.Qt.AspectRatioMode.IgnoreAspectRatio)
-        self.video_label.setPixmap(pix)
-        self._current_pixmap = pix
-
-    def set_debug_text(self, text: str):
-        self.debug_label.setText(text)
-        self.debug_label.adjustSize()
-        self.debug_label.move(10, 10)
-        if not self.debug_label.isVisible():
-            self.debug_label.show()
-
-    def showFullScreen(self):
-        super().showFullScreen()
-        self.video_label.setFixedSize(self.size())
-        self.debug_label.setParent(self)
-        self.debug_label.raise_()
-
-    def keyPressEvent(self, event):
-        self.exit_fullscreen.emit()
-
-    def mousePressEvent(self, event):
-        self.exit_fullscreen.emit()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._current_pixmap:
-            self.video_label.setFixedSize(self.size())
-            self.set_frame(np.array(self._current_pixmap.toImage().bits()).reshape((self._current_pixmap.height(), self._current_pixmap.width(), 4)) if False else None)
-
+        super().__init__(); self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint);self.video_label=QtWidgets.QLabel(self);self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter);lay=QtWidgets.QVBoxLayout(self);lay.setContentsMargins(0,0,0,0);lay.addWidget(self.video_label)
+        self.debug_label=QtWidgets.QLabel(self);self.debug_label.setStyleSheet('color:white;');self.debug_label.hide();
+    def set_frame(self,frame):
+        if frame is None: return
+        h,w,ch=frame.shape;bytes_per_line=ch*w;img=QtGui.QImage(frame.data.tobytes(),w,h,bytes_per_line,QtGui.QImage.Format.Format_RGB888);pix=QtGui.QPixmap.fromImage(img).scaled(self.width(),self.height(),QtCore.Qt.AspectRatioMode.IgnoreAspectRatio);self.video_label.setPixmap(pix)
+    def set_debug_text(self,t): self.debug_label.setText(t);self.debug_label.adjustSize();self.debug_label.show();
+    def showFullScreen(self): super().showFullScreen(); self.video_label.setFixedSize(self.size()); self.debug_label.raise_()
+    def keyPressEvent(self,e): self.exit_fullscreen.emit()
+    def mousePressEvent(self,e): self.exit_fullscreen.emit()
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("CCard ver 1.2.1")
-        self.resize(WIDTH, HEIGHT)
-        self.setMinimumSize(1024, 768)
-
-        self.debug_mode = True
-        self.current_frame = None
-        self.video_fps = 0.0
-        self.cpu = 0.0
-        self.ram_mb = 0.0
-
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        main_layout = QtWidgets.QVBoxLayout(central)
-        main_layout.setContentsMargins(0,0,0,0)
-        main_layout.setSpacing(0)
-
-        self.video_area = QtWidgets.QWidget()
-        self.video_area_layout = QtWidgets.QVBoxLayout(self.video_area)
-        self.video_area_layout.setContentsMargins(0,0,0,0)
-        self.video_area_layout.setSpacing(0)
-        main_layout.addWidget(self.video_area, 1)
-
-        self.video_label = QtWidgets.QLabel()
-        self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("background-color: black;")
-        self.video_area_layout.addWidget(self.video_label)
-
-        self.debug_label = QtWidgets.QLabel(self.video_area)
-        self.debug_label.setStyleSheet("color: white; background: rgba(0,0,0,0);")
-        self.debug_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.debug_label.move(10, 10)
-        self.debug_label.raise_()
-
-        self.controls = QtWidgets.QWidget()
-        self.controls.setFixedHeight(CONTROL_PANEL_HEIGHT)
-        controls_layout = QtWidgets.QHBoxLayout(self.controls)
-        controls_layout.setContentsMargins(6,6,6,6)
-        controls_layout.setSpacing(8)
-        main_layout.addWidget(self.controls)
-
-        self.video_devices = list_video_devices()
-        self.audio_devices = list_audio_input_devices()
-        # Extra safety: ensure unique audio device names (normalize)
-        try:
-            unique_audio = []
-            seen_norm_local = set()
-            for name in self.audio_devices:
-                if not name:
-                    continue
-                norm = unicodedata.normalize('NFKC', name).strip().lower()
-                norm = re.sub(r"[^\w\s]", "", norm)
-                norm = re.sub(r"\s+", " ", norm).strip()
-                if norm and norm not in seen_norm_local:
-                    unique_audio.append(name)
-                    seen_norm_local.add(norm)
-            self.audio_devices = unique_audio
-        except Exception:
-            pass
-
-        self.camera_label = QtWidgets.QLabel(get_text("camera"))
-        controls_layout.addWidget(self.camera_label)
-        self.camera_combo = QtWidgets.QComboBox()
-        self.camera_combo.addItems(self.video_devices if self.video_devices else ["No Devices"])
-        controls_layout.addWidget(self.camera_combo)
-
-        controls_layout.addStretch()
-        self.audio_label = QtWidgets.QLabel(get_text("audio_in"))
-        controls_layout.addWidget(self.audio_label)
-        self.audio_combo = QtWidgets.QComboBox()
-        self.audio_combo.addItems(self.audio_devices if self.audio_devices else ["No Audio Input Devices"])
-        controls_layout.addWidget(self.audio_combo)
-
-        self.debug_btn = QtWidgets.QPushButton(get_text("toggle_debug"))
-        self.fullscreen_btn = QtWidgets.QPushButton(get_text("fullscreen"))
-        self.settings_btn = QtWidgets.QPushButton(get_text("settings"))
-        controls_layout.addWidget(self.debug_btn)
-        controls_layout.addWidget(self.fullscreen_btn)
-        controls_layout.addWidget(self.settings_btn)
-
-        self.camera_combo.currentIndexChanged.connect(self.on_camera_changed)
+        super().__init__(); self.setWindowTitle('CCard'); self.resize(1280,720)
+        self.cur_frame=None;self.fps=0;self.debug=True
+        c=QtWidgets.QWidget();self.setCentralWidget(c);l=QtWidgets.QVBoxLayout(c);l.setContentsMargins(0,0,0,0)
+        self.video_label=QtWidgets.QLabel();self.video_label.setStyleSheet('background:black');self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter);l.addWidget(self.video_label,1)
+        bar=QtWidgets.QWidget();bar.setFixedHeight(80);hl=QtWidgets.QHBoxLayout(bar);hl.setContentsMargins(6,6,6,6);l.addWidget(bar)
+        self.source_combo=QtWidgets.QComboBox();self.source_combo.addItems([txt('camera'),txt('android_device')]);self.source_combo.currentIndexChanged.connect(self.on_source_changed);
+        self.source_label=QtWidgets.QLabel(txt('source'));hl.addWidget(self.source_label);hl.addWidget(self.source_combo)
+        self.camera_label=QtWidgets.QLabel(txt('camera'));hl.addWidget(self.camera_label)
+        self.camera_combo=QtWidgets.QComboBox();self.camera_combo.addItems(list_video_devices() or ['No Devices']);hl.addWidget(self.camera_combo)
+        self.android_device_combo=QtWidgets.QComboBox();self.android_device_combo.hide();hl.addWidget(self.android_device_combo)
+        self.refresh_android_btn=QtWidgets.QPushButton('Scan');self.refresh_android_btn.hide();self.refresh_android_btn.clicked.connect(self.refresh_android_devices);hl.addWidget(self.refresh_android_btn)
+        hl.addStretch();
+        self.audio_label=QtWidgets.QLabel(txt('audio_in'));hl.addWidget(self.audio_label)
+        self.audio_combo=QtWidgets.QComboBox();self.audio_combo.addItems(list_audio_input_devices() or ['No Audio']);hl.addWidget(self.audio_combo)
+        self.debug_btn=QtWidgets.QPushButton(txt('toggle_debug'));hl.addWidget(self.debug_btn);self.debug_btn.clicked.connect(self._toggle_debug)
+        self.fullscreen_btn=QtWidgets.QPushButton(txt('fullscreen'));hl.addWidget(self.fullscreen_btn);self.fullscreen_btn.clicked.connect(self._open_fullscreen)
+        self.settings_btn=QtWidgets.QPushButton(txt('settings'));hl.addWidget(self.settings_btn);self.settings_btn.clicked.connect(self.open_settings)
+        self.audio_btn=QtWidgets.QPushButton(txt('sound_on'));hl.addWidget(self.audio_btn);self.audio_btn.hide();self.audio_btn.clicked.connect(self.toggle_audio)
+        self.debug_label=QtWidgets.QLabel(self.video_label);self.debug_label.setStyleSheet('color:white;background:transparent');self.debug_label.move(10,10);self.debug_label.hide()
+        self.cam_thread=None;self.scrcpy_thread=None;self.audio_worker=None
+        self.setMinimumSize(400,300)
+        self._start_camera(0,tuple(SETTINGS.get('resolution',[1280,720])),SETTINGS.get('fps',120))
+        self._start_audio_default()
         self.audio_combo.currentIndexChanged.connect(self.on_audio_changed)
-        self.debug_btn.clicked.connect(self.toggle_debug)
-        self.fullscreen_btn.clicked.connect(self.open_fullscreen)
-        self.settings_btn.clicked.connect(self.open_settings)
+        self.ui_timer=QtCore.QTimer(self);self.ui_timer.setInterval(500);self.ui_timer.timeout.connect(self._update_stats_and_overlay);self.ui_timer.start()
+        self.fullscreen_window=FullscreenVideoWindow();self.fullscreen_window.exit_fullscreen.connect(self._close_fullscreen)
+        self.is_debug=True
 
-        self.camera_thread = None
-        self.audio_worker = None
+    def _start_camera(self,idx,res,fps):
+        try:
+            if self.cam_thread and self.cam_thread.isRunning(): self.cam_thread.stop()
+        except: pass
+        self.cam_thread=CamThread(i=idx,res=res,fps=fps);self.cam_thread.frame_signal.connect(self._on_frame);self.cam_thread.fps_signal.connect(self._on_fps);self.cam_thread.start()
 
-        self.fullscreen_window = FullscreenVideoWindow()
-        self.fullscreen_window.exit_fullscreen.connect(self.close_fullscreen)
-
-        self.ui_timer = QtCore.QTimer(self)
-        self.ui_timer.setInterval(500)  # ms
-        self.ui_timer.timeout.connect(self._update_stats_and_overlay)
-        self.ui_timer.start()
-
-
-
-        res = SETTINGS.get("resolution", [1280, 720])
-        fps = SETTINGS.get("fps", 120)
-        self._start_camera(index=0, resolution=tuple(res), fps=fps)
-        self._start_default_audio()
-
-
-
-        self.setStyleSheet(apply_theme())
-        self.fullscreen_window.setStyleSheet(apply_theme())
-
-        if WIN32_AVAILABLE:
-            try:
-                self._start_win32_device_watcher()
-            except Exception as e:
-                print("win32 watcher start failed, fallback to polling:", e)
-                self._start_device_poller()
+    def _start_scrcpy(self,did=None,res=(1280,720),fps=30):
+        try:
+            if self.scrcpy_thread and self.scrcpy_thread.isRunning(): self.scrcpy_thread.stop()
+        except: pass
+        # prefer explicit did, otherwise take selected android device when in Android mode
+        sel = None
+        if did:
+            sel = did
+        elif self.source_combo.currentIndex()==1 and self.android_device_combo.count()>0:
+            sel = self.android_device_combo.currentText()
         else:
-            self._start_device_poller()
+            sel = self.camera_combo.currentText()
+        # Validate selected device (avoid placeholder values)
+        if not sel or any(x in str(sel) for x in ('No Devices','No Devices Found')):
+            QtWidgets.QMessageBox.warning(None, 'Error', 'No Android device selected. Scan first!')
+            return
+        dev = sel
+        self.scrcpy_thread=ScrcpyThread(did=dev,res=res,fps=fps,parent_hwnd=int(self.video_label.winId()) if hasattr(self.video_label,'winId') else None)
+        self.scrcpy_thread.frame_signal.connect(self._on_frame);self.scrcpy_thread.fps_signal.connect(self._on_fps);self.scrcpy_thread.status_signal.connect(lambda s:print('scrcpy',s));self.scrcpy_thread.start()
 
-    def _start_camera(self, index=0, resolution=(1280,720), fps=120):
-        if self.camera_thread and self.camera_thread.isRunning():
+    def _on_frame(self,frame):
+        self.cur_frame=frame
+        # If Android source selected, show prompt unless scrcpy is embedded
+        if self.source_combo.currentIndex()==1:
             try:
-                self.camera_thread.stop()
+                if self.scrcpy_thread and getattr(self.scrcpy_thread,'mirror',None) and getattr(self.scrcpy_thread.mirror,'embedded',False):
+                    return
             except Exception:
                 pass
-        self.camera_thread = CameraThread(cam_index=index, resolution=resolution, fps=fps)
-        self.camera_thread.frame_signal.connect(self._on_frame)
-        self.camera_thread.fps_signal.connect(self._on_cam_fps)
-        self.camera_thread.start()
-
-    def _on_frame(self, frame: np.ndarray):
-        self.current_frame = frame
-        if frame is None:
-            return
-        h, w, ch = frame.shape
-        bytes_per_line = ch * w
-        qimg = QtGui.QImage(frame.data.tobytes(), w, h, bytes_per_line, QtGui.QImage.Format.Format_RGB888)
-        target_w = self.video_label.width()
-        target_h = self.video_label.height()
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(target_w, target_h, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio)
+            self._show_prompt(); return
+        if frame is None: return
+        h,w,ch=frame.shape;bytes_per_line=ch*w
+        q=QtGui.QImage(frame.data.tobytes(),w,h,bytes_per_line,QtGui.QImage.Format.Format_RGB888)
+        pix=QtGui.QPixmap.fromImage(q).scaled(self.video_label.width(),self.video_label.height(),QtCore.Qt.AspectRatioMode.IgnoreAspectRatio)
         self.video_label.setPixmap(pix)
 
-        if self.fullscreen_window.isVisible():
-            self.fullscreen_window.set_frame(frame)
+    def _show_prompt(self):
+        w=self.video_label.width() or 640;h=self.video_label.height() or 480
+        p=QtGui.QPixmap(w,h);p.fill(QtGui.QColor('black'));pt=QtGui.QPainter(p);pt.setPen(QtGui.QColor('white'));f=pt.font();f.setPointSize(20);pt.setFont(f);pt.drawText(p.rect(),QtCore.Qt.AlignmentFlag.AlignCenter,'Switch to phone window');pt.end();self.video_label.setPixmap(p)
 
-    def _on_cam_fps(self, fps):
-        self.video_fps = fps
+    def _on_fps(self,f): self.fps=f
 
-    def _start_default_audio(self):
-        audio_list = list_audio_input_devices()
-        if audio_list:
-            try:
-                devices = sd.query_devices()
-                for i, d in enumerate(devices):
-                    if d['max_input_channels'] > 0:
-                        sd.default.device = (i, None)
-                        self._start_audio(i)
-                        break
-            except Exception as e:
-                print("start default audio error:", e)
-
-    def _start_audio(self, device_index):
-        if self.audio_worker:
-            try:
-                self.audio_worker.stop()
-            except Exception:
-                pass
-        self.audio_worker = AudioWorker(device_index)
-        self.audio_worker.start()
-
-    def on_camera_changed(self, idx):
-
-        print("Camera changed ->", idx)
+    def _start_audio_default(self):
+        lst=list_audio_input_devices()
+        if not lst: return
         try:
-            res = SETTINGS.get("resolution", [1280, 720])
-            fps = SETTINGS.get("fps", 120)
-            self._start_camera(index=idx, resolution=tuple(res), fps=fps)
+            devs=sd.query_devices()
+            for i,d in enumerate(devs):
+                if d['max_input_channels']>0:
+                    sd.default.device=(i,None); self._start_audio(i); break
+        except Exception as e: print('audio start err',e)
+
+    def refresh_android_devices(self):
+        try:
+            out=subprocess.run(['adb','devices'],capture_output=True,text=True,timeout=5)
+            lines=[l.strip() for l in out.stdout.splitlines() if l.strip() and not l.startswith('List of devices')]
+            devs=[]
+            for l in lines:
+                parts=l.split()# '6e61342d0306\tdevice'
+                if parts:
+                    devs.append(parts[0])
+            if not devs:
+                devs=[]
+            self.android_device_combo.blockSignals(True);
+            self.android_device_combo.clear();
+            if devs:
+                self.android_device_combo.addItems(devs)
+            else:
+                self.android_device_combo.addItem('No Devices Found')
+            self.android_device_combo.blockSignals(False)
+            self.refresh_android_btn.setText('Refresh ✓' if devs else 'Refresh')
         except Exception as e:
-            print("on_camera_changed error:", e)
+            print('adb scan err',e); self.android_device_combo.clear(); self.android_device_combo.addItem('No Devices Found')
 
-    def on_audio_changed(self, idx):
-        name = self.audio_combo.currentText()
-        print("Audio changed ->", name)
+    def _start_audio(self,i):
         try:
-            devices = sd.query_devices()
-            found = None
-            for i, d in enumerate(devices):
-                if d['name'] == name and d['max_input_channels'] > 0:
-                    found = i
-                    break
+            if self.audio_worker: self.audio_worker.stop()
+        except: pass
+        self.audio_worker=AudioWorker(i); self.audio_worker.start()
+
+    def on_audio_changed(self,idx):
+        name=self.audio_combo.currentText()
+        try:
+            devices=sd.query_devices()
+            found=None
+            for i,d in enumerate(devices):
+                if d.get('name')==name and d.get('max_input_channels',0)>0:
+                    found=i;break
             if found is not None:
-                sd.default.device = (found, None)
+                sd.default.device=(found,None)
                 self._start_audio(found)
         except Exception as e:
-            print("on_audio_changed error:", e)
-
-    def toggle_debug(self):
-        self.debug_mode = not self.debug_mode
-        if not self.debug_mode:
-            self.debug_label.hide()
-            self.fullscreen_window.debug_label.hide()
-        else:
-            self.debug_label.show()
-            self.fullscreen_window.debug_label.show()
-
-    def open_fullscreen(self):
-        self.fullscreen_window.resize(QtWidgets.QApplication.primaryScreen().size())
-        if self.current_frame is not None:
-            self.fullscreen_window.set_frame(self.current_frame)
-        if self.debug_mode:
-            self.fullscreen_window.set_debug_text(self._compose_debug_text())
-        self.fullscreen_window.showFullScreen()
-
-    def close_fullscreen(self):
-        self.fullscreen_window.hide()
-
-    def _start_device_poller(self):
-        self._device_poller_stop = threading.Event()
-        self._device_poller_stop.clear()
-        def poller_loop():
-            prev_v = None
-            prev_a = None
-            while not self._device_poller_stop.is_set():
-                try:
-                    v = list_video_devices()
-                    a = list_audio_input_devices()
-                    if v != prev_v or a != prev_a:
-                        prev_v = v
-                        prev_a = a
-                        QtCore.QMetaObject.invokeMethod(self, "_update_device_lists", QtCore.Qt.ConnectionType.QueuedConnection,
-                                                        QtCore.Q_ARG(list, v), QtCore.Q_ARG(list, a))
-                except Exception as e:
-                    print("Device poller error:", e)
-                time.sleep(DEVICE_POLL_INTERVAL)
-        self._poller_thread = threading.Thread(target=poller_loop, daemon=True)
-        self._poller_thread.start()
-
-    def _start_win32_device_watcher(self):
-        if not WIN32_AVAILABLE:
-            raise RuntimeError("pywin32 not available")
-
-        def wndproc(hwnd, msg, wparam, lparam):
-            if msg == win32con.WM_DEVICECHANGE:
-                v = list_video_devices()
-                a = list_audio_input_devices()
-                QtCore.QMetaObject.invokeMethod(self, "_update_device_lists", QtCore.Qt.ConnectionType.QueuedConnection,
-                                                QtCore.Q_ARG(list, v), QtCore.Q_ARG(list, a))
-            return True
-
-        message_map = {win32con.WM_DEVICECHANGE: wndproc}
-        wc = win32gui.WNDCLASS()
-        hinst = wc.hInstance = win32gui.GetModuleHandle(None)
-        wc.lpszClassName = "CCardDeviceWatcher"
-        wc.lpfnWndProc = wndproc
-        class_atom = win32gui.RegisterClass(wc)
-        hwnd = win32gui.CreateWindowEx(0, class_atom, "CCardWatcher", 0, 0, 0, 0, 0, 0, 0, hinst, None)
-        def message_loop():
-            try:
-                while True:
-                    win32gui.PumpWaitingMessages()
-                    time.sleep(0.1)
-            except Exception as e:
-                print("win32 message loop terminated:", e)
-        self._win32_msg_thread = threading.Thread(target=message_loop, daemon=True)
-        self._win32_msg_thread.start()
-
-    @QtCore.pyqtSlot(list, list)
-    def _update_device_lists(self, video_list, audio_list):
-        cur_video = self.camera_combo.currentText()
-        self.camera_combo.blockSignals(True)
-        self.camera_combo.clear()
-        if video_list:
-            self.camera_combo.addItems(video_list)
-        else:
-            self.camera_combo.addItem("No Devices")
-        idx = -1
-        try:
-            idx = self.camera_combo.findText(cur_video)
-        except Exception:
-            idx = -1
-        if idx != -1:
-            self.camera_combo.setCurrentIndex(idx)
-        else:
-            self.camera_combo.setCurrentIndex(0)
-        self.camera_combo.blockSignals(False)
-
-        # Audio
-        cur_audio = self.audio_combo.currentText()
-        self.audio_combo.blockSignals(True)
-        self.audio_combo.clear()
-        if audio_list:
-            # Ensure audio_list is deduplicated here too (extra safety)
-            unique_audio = []
-            seen_norm_local = set()
-            for name in audio_list:
-                try:
-                    if not name:
-                        continue
-                    norm = unicodedata.normalize('NFKC', name).strip().lower()
-                    norm = re.sub(r"[^\w\s]", "", norm)
-                    norm = re.sub(r"\s+", " ", norm).strip()
-                    if norm and norm not in seen_norm_local:
-                        unique_audio.append(name)
-                        seen_norm_local.add(norm)
-                except Exception:
-                    continue
-            self.audio_combo.addItems(unique_audio)
-        else:
-            self.audio_combo.addItem("No Audio Input Devices")
-        idx = -1
-        try:
-            idx = self.audio_combo.findText(cur_audio)
-        except Exception:
-            idx = -1
-        if idx != -1:
-            self.audio_combo.setCurrentIndex(idx)
-        else:
-            self.audio_combo.setCurrentIndex(0)
-        self.audio_combo.blockSignals(False)
-
-        self.video_devices = video_list
-        # store deduplicated audio devices
-        try:
-            self.audio_devices = unique_audio
-        except Exception:
-            self.audio_devices = audio_list
+            print('on_audio_changed err',e)
 
     def open_settings(self):
-        dialog = SettingsDialog(self)
-        dialog.setStyleSheet(apply_theme())
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            new_settings = dialog.get_settings()
-            SETTINGS["theme"] = new_settings["theme"]
-            SETTINGS["language"] = new_settings["language"]
-            SETTINGS["resolution"] = new_settings["resolution"]
-            SETTINGS["fps"] = new_settings["fps"]
-            save_settings(SETTINGS)
-            # Apply new settings
-            style = apply_theme()
-            self.setStyleSheet(style)
-            self.fullscreen_window.setStyleSheet(style)
+        dlg=SettingsDialog(self);dlg.theme_combo.setCurrentText(txt(SETTINGS.get('theme','dark')))
+        dlg.lang_combo.setCurrentIndex(0 if SETTINGS.get('language','uk')=='uk' else 1)
+        res=f"{SETTINGS.get('resolution',[1280,720])[0]}x{SETTINGS.get('resolution',[1280,720])[1]}";dlg.res_combo.setCurrentText(res)
+        dlg.fps_combo.setCurrentText(str(SETTINGS.get('fps',120)))
+        if dlg.exec()==QtWidgets.QDialog.DialogCode.Accepted:
+            new=dlg.get(); SETTINGS.update(new); save_settings(SETTINGS)
+            # apply theme/text
+            QtWidgets.QApplication.instance().setStyleSheet(apply_theme())
+            self.fullscreen_window.setStyleSheet(apply_theme())
             self.update_ui_text()
-            # Restart camera with new settings
-            res = new_settings["resolution"]
-            fps = new_settings["fps"]
-            cam_idx = self.camera_combo.currentIndex()
-            self._start_camera(index=cam_idx, resolution=tuple(res), fps=fps)
+            # restart camera
+            self._start_camera(self.camera_combo.currentIndex(),tuple(SETTINGS.get('resolution',[1280,720])),SETTINGS.get('fps',120))
 
     def update_ui_text(self):
-        self.camera_label.setText(get_text("camera"))
-        self.audio_label.setText(get_text("audio_in"))
-        self.debug_btn.setText(get_text("toggle_debug"))
-        self.fullscreen_btn.setText(get_text("fullscreen"))
-        self.settings_btn.setText(get_text("settings"))
+        self.debug_btn.setText(txt('toggle_debug'));self.fullscreen_btn.setText(txt('fullscreen'));self.settings_btn.setText(txt('settings'))
+        # update labels
+        try:
+            self.source_label.setText(txt('source'))
+            # update source combo displayed names but keep current index
+            idx=self.source_combo.currentIndex()
+            self.source_combo.blockSignals(True)
+            self.source_combo.clear(); self.source_combo.addItems([txt('camera'), txt('android_device')])
+            self.source_combo.setCurrentIndex(idx)
+            self.camera_label.setText(txt('camera'))
+            self.audio_label.setText(txt('audio_in'))
+        except Exception:
+            pass
 
     def _compose_debug_text(self):
-        return f"Video FPS: {self.video_fps:.1f} | CPU: {self.cpu:.1f}% | RAM: {self.ram_mb:.1f} MB"
+        cpu=psutil.cpu_percent(interval=None)
+        mem=psutil.Process().memory_info().rss/1024/1024
+        return f"Video FPS: {self.fps:.1f} | CPU: {cpu:.1f}% | RAM: {mem:.1f} MB"
 
     def _update_stats_and_overlay(self):
-        try:
-            self.cpu = psutil.cpu_percent(interval=None)
-            mem = psutil.Process().memory_info()
-            self.ram_mb = mem.rss / (1024*1024)
-        except Exception:
-            pass
-
-        if self.debug_mode:
-            text = self._compose_debug_text()
-            self.debug_label.setText(text)
-            self.debug_label.adjustSize()
-            self.debug_label.show()
-            self.fullscreen_window.set_debug_text(text)
+        if self.is_debug:
+            self.debug_label.setText(self._compose_debug_text());self.debug_label.adjustSize();self.debug_label.show();
+            if self.fullscreen_window.isVisible(): self.fullscreen_window.set_debug_text(self._compose_debug_text())
         else:
-            self.debug_label.hide()
-            self.fullscreen_window.debug_label.hide()
+            self.debug_label.hide(); self.fullscreen_window.debug_label.hide()
 
-    def closeEvent(self, event):
+    def _toggle_debug(self): self.is_debug=not self.is_debug
+    def _open_fullscreen(self):
+        self.fullscreen_window.resize(QtWidgets.QApplication.primaryScreen().size());
+        if self.cur_frame is not None: self.fullscreen_window.set_frame(self.cur_frame)
+        if self.is_debug: self.fullscreen_window.set_debug_text(self._compose_debug_text())
+        self.fullscreen_window.showFullScreen()
+    def _close_fullscreen(self): self.fullscreen_window.hide()
+
+    def closeEvent(self,e):
+        # stop and wait for threads to finish to avoid QThread destruction warnings
         try:
-            if self.camera_thread:
-                self.camera_thread.stop()
+            if hasattr(self,'cam_thread') and self.cam_thread:
+                try: self.cam_thread.stop()
+                except Exception: pass
+                try: self.cam_thread.wait(1000)
+                except Exception: pass
         except Exception:
             pass
         try:
-            if self.audio_worker:
-                self.audio_worker.stop()
+            if hasattr(self,'scrcpy_thread') and self.scrcpy_thread:
+                try: self.scrcpy_thread.stop()
+                except Exception: pass
+                try: self.scrcpy_thread.wait(1000)
+                except Exception: pass
         except Exception:
             pass
         try:
-            if hasattr(self, "_device_poller_stop"):
-                self._device_poller_stop.set()
+            if hasattr(self,'audio_worker') and self.audio_worker:
+                try: self.audio_worker.stop()
+                except Exception: pass
         except Exception:
             pass
-        super().closeEvent(event)
+        try:
+            if hasattr(self,'ui_timer') and self.ui_timer:
+                try: self.ui_timer.stop()
+                except Exception: pass
+        except Exception:
+            pass
+        save_settings(SETTINGS)
+        super().closeEvent(e)
+
+    def on_source_changed(self,idx):
+        try:
+            idx = int(idx)
+        except Exception:
+            idx = self.source_combo.currentIndex()
+        s=self.source_combo.currentText()
+        if idx==0:
+            # Camera selected
+            self.audio_btn.hide(); self._start_camera(self.camera_combo.currentIndex(),tuple(SETTINGS.get('resolution',[1280,720])),SETTINGS.get('fps',120))
+            try:
+                if self.scrcpy_thread and self.scrcpy_thread.isRunning(): self.scrcpy_thread.stop()
+            except: pass
+            self.android_device_combo.hide(); self.refresh_android_btn.hide()
+            # stop scrcpy if running
+            try:
+                if self.scrcpy_thread and self.scrcpy_thread.isRunning():
+                    self.scrcpy_thread.stop()
+            except Exception:
+                pass
+            # show camera/fullscreen/audio controls
+            self.camera_label.show(); self.camera_combo.show(); self.fullscreen_btn.show(); self.audio_label.show(); self.audio_combo.show()
+        else:
+            # Android selected
+            self.audio_btn.show(); self._show_prompt(); self.android_device_combo.show(); self.refresh_android_btn.show(); self.refresh_android_devices();
+            # stop camera to avoid mixed frames
+            try:
+                if self.cam_thread and self.cam_thread.isRunning():
+                    self.cam_thread.stop()
+            except Exception:
+                pass
+            # hide camera/fullscreen/audio controls
+            self.camera_label.hide(); self.camera_combo.hide(); self.fullscreen_btn.hide(); self.audio_label.hide(); self.audio_combo.hide()
+            self._start_scrcpy(res=tuple(SETTINGS.get('resolution',[1280,720])),fps=30)
+
+    def toggle_audio(self):
+        state = getattr(self,'audio_on',True); state = not state; self.audio_on=state
+        if self.audio_worker: self.audio_worker.set_muted(not state); self.audio_btn.setText(txt('sound_on') if state else txt('sound_off'))
+        else:
+            if self.scrcpy_thread and self.scrcpy_thread.isRunning():
+                if state: self.scrcpy_thread.unmute_audio()
+                else: self.scrcpy_thread.mute_audio(); self.audio_btn.setText(txt('sound_on') if state else txt('sound_off'))
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    app=QtWidgets.QApplication(sys.argv);w=MainWindow();w.show();sys.exit(app.exec())
 
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
